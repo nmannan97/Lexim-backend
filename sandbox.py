@@ -27,25 +27,56 @@ mydb = mysql.connector.connect(
 rds = LeximGPTRDS()
 
 rds.set_rds_connection_str()
+target_org = '2ba0ac41-b3aa-4b96-ba47-feeddc029ccd'
 
 query1 = "SELECT * FROM aa_metrics;"
 query2 = "SELECT * FROM aa_runhistory;"
 query3 = "SELECT s3_link, first_name, last_name FROM user;"
 query4 = 'SELECT org_guid, name FROM organization' 
+query5 = sql = """
+WITH user_clean AS (
+    SELECT 
+        SUBSTRING_INDEX(SUBSTRING_INDEX(u.s3_link, 'USERS/', -1), '/', 1) AS extracted_user_guid,
+        u.first_name,
+        u.last_name,
+        u.s3_link,
+        o.name AS organization_name,
+        o.org_guid
+    FROM lexim_gpt.user u
+    JOIN lexim_gpt.organization o 
+        ON u.s3_link LIKE CONCAT('%%', o.org_guid, '%%')
+),
+runhistory_enriched AS (
+    SELECT 
+        rh.*,
+        uc.first_name,
+        uc.last_name,
+        uc.organization_name
+    FROM lexim_gpt.aa_runhistory rh
+    LEFT JOIN user_clean uc
+        ON rh.user_guid = uc.extracted_user_guid
+)
+
+SELECT 
+    run_guid,
+    task_guid,
+    create_date,
+    user_guid,
+    first_name,
+    last_name,
+    organization_name,
+    org_guid
+FROM runhistory_enriched
+WHERE org_guid = '{}';
+""".format(target_org)
 
 success, df = rds.run_query_to_df(query1)
 success, df1 = rds.run_query_to_df(query2)
 success, df2 = rds.run_query_to_df(query3)
 success, df3 = rds.run_query_to_df(query4)
+success, df4 = rds.run_query_to_df(query5)
 
-name_lookup = dict(
-    zip(
-        df2["s3_link"].astype(str),
-        df2["first_name"].astype(str) + " " + df2["last_name"].astype(str)
-    )
-)
-
-rows = df[df['meta_data'].str.contains("2ba0ac41-b3aa-4b96-ba47-feeddc029ccd", na=False)]
+rows = df[df['meta_data'].str.contains(target_org, na=False)]
 
 @app.route("/", methods=["GET"])
 def home():
@@ -72,108 +103,85 @@ def time_counter():
 @app.route("/users", methods=["GET"])
 def users():
     output = {}
-    target = "2ba0ac41-b3aa-4b96-ba47-feeddc029ccd"
+  
+    # Build user_guid → "First Last" name mapping
+    name_lookup = {
+        str(row["user_guid"]): f"{row['first_name']} {row['last_name']}".strip()
+        for _, row in df4.iterrows()
+    }
 
-    # Build user_lookup from df_user (s3_link contains org_guid)
-    user_lookup = {}
-    for _, row in df2.iterrows():
-        s3_link = str(row.get("s3_link", ""))
-        match = re.search(r"USERS/([a-f0-9\-]+)", s3_link)
-        first_name = str(row.get("first_name", "")).strip()
-        last_name = str(row.get("last_name", "")).strip()
-
-        # Extract org_guid from s3_link
-        parts = str(match).split('/')
-        if "USERS" in parts:
-            try:
-                print(parts)
-                org_index = parts.index("ORGANIZATION")
-                org_guid = parts[org_index + 1]
-                full_name = f"{first_name} {last_name}".strip()
-                if org_guid and full_name:
-                    user_lookup[org_guid] = full_name
-            except (IndexError, ValueError):
-                continue
-
-    # Extract relevant columns from df_runhistory
-    run_guids = df1["run_guid"].astype(str).tolist()
-    org_guids = df1["org_guid"].astype(str).tolist()
-    task_guids = df1["task_guid"].astype(str).tolist()
-
-    # Group tasks by run_guid for matching org
+    # Group task_guids by run_guid for the target org
     target_user = {}
-    for run_guid, org_guid, task_guid in zip(run_guids, org_guids, task_guids):
-        if org_guid == target:
+    for _, row in df1.iterrows():
+        if str(row["org_guid"]) == target_org:
+            run_guid = str(row["run_guid"])
+            task_guid = str(row["task_guid"])
             target_user.setdefault(run_guid, []).append(task_guid)
 
-    # Process each run's tasks
+    # Build usage stats per run
     for run_id, task_list in target_user.items():
-        try:
-            org_guid = df1[df1['run_guid'] == run_id]['org_guid'].values[0]
-        except IndexError:
-            org_guid = None
-
-        user_name = user_lookup.get(run_id, "Unknown")
-
         output[run_id] = {
             "tokens_in": 0,
             "tokens_out": 0,
             "duration_minutes": 0,
-            "user_name": user_name,
             "tasks": {}
         }
 
         for task_id in task_list:
-            row = df[df['task_guid'].astype(str) == str(task_id)]
-            run_row = df1[df1["task_guid"] == str(task_id)]
+            row = df[df['task_guid'].astype(str) == task_id]
+            run_row = df1[df1["task_guid"].astype(str) == task_id]
 
-            if row.empty:
+            if row.empty or run_row.empty:
                 continue
 
+            # Parse token counts
             try:
                 tokens_in = int(row['tokens_in'].values[0])
                 tokens_out = int(row['tokens_out'].values[0])
             except Exception:
                 tokens_in = tokens_out = 0
 
+            # Parse compute time
             try:
-                raw_start = row['start_time'].values[0]
-                raw_end = row['end_time'].values[0]
-                start_time = pd.to_datetime(raw_start, errors='coerce')
-                end_time = pd.to_datetime(raw_end, errors='coerce')
-                if pd.isnull(start_time) or pd.isnull(end_time):
-                    raise ValueError("start_time or end_time is NaT")
-                duration_minutes = (end_time - start_time).total_seconds() / 60
+                start_time = pd.to_datetime(row['start_time'].values[0], errors='coerce')
+                end_time = pd.to_datetime(row['end_time'].values[0], errors='coerce')
+                duration_minutes = (end_time - start_time).total_seconds() / 60 if start_time and end_time else 0
             except Exception:
                 duration_minutes = 0
 
+            # Parse run datetime
             try:
-                run_datetime_raw = run_row['run_date'].values[0] if 'run_date' in run_row.columns else None
-                run_datetime = str(pd.to_datetime(run_datetime_raw, errors='coerce')) if run_datetime_raw else None
+                run_datetime = pd.to_datetime(run_row['create_date'].values[0], errors='coerce')
+                run_datetime = str(run_datetime) if pd.notnull(run_datetime) else None
             except Exception:
                 run_datetime = None
 
-            # Accumulate
+            # Get user name from user_guid
+            try:
+                user_guid = str(run_row['user_guid'].values[0])
+            except Exception:
+                user_guid = "Unknown"
+
+            user_name = name_lookup.get(user_guid, "Unknown")
+
+            # Accumulate task info
             output[run_id]["tokens_in"] += tokens_in
             output[run_id]["tokens_out"] += tokens_out
             output[run_id]["duration_minutes"] += duration_minutes
 
-            # Task-level entry
             output[run_id]["tasks"][task_id] = {
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
-                "duration": "{:,.2f} minutes".format(duration_minutes),
-                "run_datetime": run_datetime
+                "duration": f"{duration_minutes:,.2f} minutes",
+                "run_datetime": run_datetime,
+                "user_name": user_name
             }
 
-    # Final formatting
-    for user in output:
-        minutes = output[user]["duration_minutes"]
-        output[user]["duration"] = "{:,.2f} minutes".format(minutes)
-        del output[user]["duration_minutes"]
+        # Format run-level duration
+        output[run_id]["duration"] = f"{output[run_id]['duration_minutes']:,.2f} minutes"
+        del output[run_id]["duration_minutes"]
 
     return jsonify(output)
-
 
 
 if __name__ == "__main__":

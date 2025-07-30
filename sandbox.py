@@ -18,8 +18,8 @@ load_dotenv()
 mydb = mysql.connector.connect(
     host="lexim-gpt-dev.czph03cyjldb.us-west-1.rds.amazonaws.com",
     port=3306,
-    user="Naeem.Mannan",
-    password="Welcome_2_Lexim",
+    user="",
+    password="",
     database="lexim_gpt" 
 )
 
